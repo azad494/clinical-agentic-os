@@ -1,0 +1,31 @@
+# Web Framework & API
+fastapi
+uvicorn[standard]
+
+# Database & Persistence (SQLAlchemy & Async)
+sqlalchemy
+psycopg2-binary
+alembic
+
+# Vector Search & RAG
+qdrant-client
+langchain-core
+langchain-qdrant
+
+# Orchestration & Logic
+langgraph
+pydantic
+pydantic-settings
+
+# Background Tasks & Queue
+celery
+redis
+
+# Telemetry & FinOps
+litellm
+timescaledb # (Optional, depending on your ingestion script)
+
+# Data Processing & Security
+pandas
+numpy
+python-multipart  # Required for file uploads in FastAPI

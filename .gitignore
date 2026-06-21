@@ -1,0 +1,24 @@
+# --- Python ---
+__pycache__/
+*.py[cod]
+*$py.class
+venv/
+.venv/
+env/
+.env
+
+# --- Docker & Databases ---
+# We never commit the actual data volumes
+postgres_data/
+qdrant_data/
+timescale_data/
+
+# --- IDE & System ---
+.vscode/
+.idea/
+.DS_Store
+
+# --- Build & Logs ---
+build/
+dist/
+*.log
