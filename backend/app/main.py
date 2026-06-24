@@ -1,35 +1,226 @@
-from fastapi import FastAPI, UploadFile, File
+from fastapi import FastAPI, UploadFile, File, HTTPException, WebSocket, WebSocketDisconnect, Depends
 from fastapi.middleware.cors import CORSMiddleware
+from sqlalchemy.orm import Session
+from pydantic import BaseModel
+from typing import List, Dict, Any
+import httpx  # <-- NEW: For secure async API fetching
+import fitz   # PyMuPDF
+import io
+import os
+import base64
+import pandas as pd
+from litellm import completion, acompletion 
 
-app = FastAPI(
-    title="Clinical Agentic OS",
-    version="1.0.0"
-)
+# --- NEW: Database Imports ---
+import models
+from database import get_db, engine
 
+# Create tables on startup (Standard for Phase 1 local development)
+models.Base.metadata.create_all(bind=engine)
+
+# 1. Initialize your FastAPI app
+app = FastAPI(title="Clinical Agentic OS API")
+
+# 2. Setup CORS
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:3000"], 
+    allow_origins=["*"], # In production, secure this to localhost:3000
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
+ALLOWED_EXTENSIONS = {
+    ".pdf", ".csv", ".json", ".html", ".htm", 
+    ".doc", ".docx", ".txt", ".png", ".jpg", ".jpeg",
+    ".xlsx", ".xls"
+}
+
+# --- 3. HEALTH CHECK ENDPOINT ---
 @app.get("/health")
 async def health_check():
     return {
         "postgres_status": "connected",
-        "qdrant_status": "connected"
+        "qdrant_status": "connected",
+        "status": "healthy"
     }
 
-# --- NEW: The Upload Door ---
+# --- 4. WEBSOCKET CHAT ENDPOINT ---
+@app.websocket("/ws/chat")
+async def websocket_chat(websocket: WebSocket):
+    await websocket.accept()
+    try:
+        while True:
+            data = await websocket.receive_text()
+            await websocket.send_json({"type": "status", "content": "Thinking..."})
+            
+            try:
+                response = await acompletion(
+                    model="gemini/gemini-2.5-flash",
+                    messages=[{"role": "user", "content": data}],
+                    stream=True
+                )
+                
+                async for chunk in response: #type: ignore
+                    token = chunk.choices[0].delta.content
+                    if token:
+                        await websocket.send_json({
+                            "type": "token",
+                            "content": token
+                        })
+                
+                await websocket.send_json({"type": "done"})
+
+            except Exception as llm_error:
+                print(f"LLM Generation Error: {str(llm_error)}")
+                await websocket.send_json({"type": "error", "content": "Failed to generate AI response."})
+
+    except WebSocketDisconnect:
+        print("Client disconnected from chat.")
+
+
+# --- 5. THE DYNAMIC API FETCHER (MIMIC PROXY) ---
+class APIFetchRequest(BaseModel):
+    endpoint_url: str
+
+@app.post("/api/v1/fetch-clinical-api")
+async def fetch_and_stage_clinical_api(
+    request: APIFetchRequest, 
+    db: Session = Depends(get_db)
+):
+    """Securely fetches JSON from clinical APIs and stages it for AI Sanitization."""
+    try:
+        async with httpx.AsyncClient() as client:
+            response = await client.get(request.endpoint_url)
+            response.raise_for_status() 
+            json_payload = response.json()
+            
+    except httpx.HTTPError as e:
+        raise HTTPException(status_code=400, detail=f"External API Fetch Failed: {str(e)}")
+
+    try:
+        # Inject the structured JSON into PostgreSQL
+        new_staged_doc = models.DocumentStaging(
+            source=models.IngestionSource.DYNAMIC_API_UI,
+            file_type="application/json",
+            raw_json=json_payload, 
+            status=models.DocumentStatus.PENDING_REVIEW
+        )
+        db.add(new_staged_doc)
+        db.commit()
+        db.refresh(new_staged_doc)
+        
+        return {
+            "status": "success", 
+            "message": "API data successfully staged for human review.", 
+            "staging_id": new_staged_doc.id
+        }
+        
+    except Exception as db_error:
+        db.rollback()
+        raise HTTPException(status_code=500, detail=f"Database Insertion Failed: {str(db_error)}")
+
+
+# --- 6. THE UPGRADED MANUAL UPLOAD ENDPOINT ---
 @app.post("/upload")
-async def upload_document(file: UploadFile = File(...)):
-    # 1. Print to the terminal so we can see it arrived safely
-    print(f"=====================================")
-    print(f"📥 RECEIVED FILE: {file.filename}")
-    print(f"=====================================")
-    
-    # 2. (Future Step) Here is where we will send it to Qdrant/LangChain
-    
-    # 3. Send a thumbs-up back to the React frontend
-    return {"filename": file.filename, "status": "Successfully received by Python backend!"}
+async def upload_clinical_document(
+    file: UploadFile = File(...),
+    db: Session = Depends(get_db)  # <-- NEW: Database Injection
+):
+    if not file.filename:
+        raise HTTPException(status_code=400, detail="Filename is missing.")
+
+    file_ext = os.path.splitext(file.filename)[1].lower()
+    if file_ext not in ALLOWED_EXTENSIONS:
+        raise HTTPException(status_code=400, detail=f"Unsupported file type: {file_ext}")
+
+    try:
+        contents = await file.read()
+        extracted_text = ""
+        base64_image = None
+
+        # --- THE PARSER ROUTER ---
+        if file_ext == ".pdf":
+            pdf_stream = io.BytesIO(contents)
+            doc = fitz.open(stream=pdf_stream, filetype="pdf")
+            max_pages = min(len(doc), 3) 
+            for page_num in range(max_pages):
+                extracted_text += str(doc.load_page(page_num).get_text("text"))
+            doc.close()
+
+        elif file_ext in [".xlsx", ".xls"]:
+            excel_stream = io.BytesIO(contents)
+            df = pd.read_excel(excel_stream)
+            extracted_text = df.head(50).to_string()
+
+        elif file_ext in [".json", ".csv", ".txt", ".html", ".htm"]:
+            extracted_text = contents.decode("utf-8")[:10000] 
+
+        elif file_ext in [".png", ".jpg", ".jpeg"]:
+            base64_image = base64.b64encode(contents).decode("utf-8")
+            extracted_text = "[IMAGE_FILE_DETECTED]" # Placeholder for text column
+            
+        elif file_ext in [".doc", ".docx"]:
+            extracted_text = f"[DOC_FILE_DETECTED: Filename: {file.filename}]"
+
+        if not extracted_text.strip() and not base64_image:
+            raise HTTPException(status_code=400, detail="Could not extract data from the document.")
+
+        # --- THE GEMINI CLASSIFICATION BRAIN ---
+        messages: List[Dict[str, Any]] = [
+            {"role": "system", "content": "You are a medical document classifier. Reply ONLY with one of these categories: Patient_EHR, Clinical_Guidelines, Payer_Policy, Lab_Results, Imaging_Report, Unknown."}
+        ]
+
+        if base64_image:
+            messages.append({
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "Classify this clinical image:"},
+                    {"type": "image_url", "image_url": {"url": f"data:image/{file_ext[1:]};base64,{base64_image}"}}
+                ]
+            })
+        else:
+            messages.append({
+                "role": "user", 
+                "content": f"Classify this text:\n{extracted_text[:3000]}"
+            })
+
+        response: Any = completion(
+            model="gemini/gemini-2.5-flash",
+            messages=messages
+        )
+        category = response.choices[0].message.content.strip()
+
+        # --- NEW: UNIVERSAL DATABASE INJECTION ---
+        # Before returning to the UI, save the parsed text safely in Postgres
+        new_staged_doc = models.DocumentStaging(
+            source=models.IngestionSource.MANUAL_UPLOAD,
+            filename=file.filename,
+            file_type=file.content_type or file_ext,
+            raw_text=extracted_text, 
+            status=models.DocumentStatus.PENDING_REVIEW
+        )
+        db.add(new_staged_doc)
+        db.commit()
+        db.refresh(new_staged_doc)
+
+        if category == "Unknown":
+            return {
+                "status": "requires_approval",
+                "filename": file.filename,
+                "category": category,
+                "staging_id": new_staged_doc.id,
+                "message": "Document type not recognized. Staged for review."
+            }
+        
+        return {
+            "status": "success",
+            "filename": file.filename,
+            "category": category,
+            "staging_id": new_staged_doc.id,
+            "message": f"Successfully parsed and staged as {category}."
+        }
+
+    except Exception as e:
+        print(f"Ingestion error: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Failed to process document: {str(e)}")

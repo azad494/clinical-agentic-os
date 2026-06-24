@@ -9,7 +9,7 @@ services:
       POSTGRES_PASSWORD: supersecurepassword
       POSTGRES_DB: clinical_os
     ports:
-      - "5432:5432"
+      - "5434:5432"
     volumes:
       - postgres_data:/var/lib/postgresql/data
     restart: unless-stopped
@@ -29,7 +29,7 @@ services:
     environment:
       POSTGRES_PASSWORD: telemetrypassword
     ports:
-      - "5433:5432" # 5433 so it doesn't clash with normal Postgres
+      - "5433:5432"
     volumes:
       - timescale_data:/var/lib/postgresql/data
     restart: unless-stopped
@@ -38,7 +38,7 @@ services:
     image: redis:7-alpine
     container_name: clinical_redis
     ports:
-      - "6379:6379"
+      - "6380:6379"
     restart: unless-stopped
 
   backend:
@@ -46,17 +46,29 @@ services:
     container_name: clinical_backend
     ports:
       - "8000:8000"
-    environment:
-      - DATABASE_URL=postgresql://admin:supersecurepassword@postgres:5432/clinical_os
-      - REDIS_URL=redis://redis:6379/0
-      - QDRANT_URL=http://qdrant:6333
+    env_file:
+      - .env
     depends_on:
       - postgres
       - qdrant
       - redis
       - timescaledb
     volumes:
-      - ./backend:/app
+      - ./backend/app:/app
+    restart: unless-stopped
+
+  frontend:
+    build: ./frontend
+    container_name: clinical_frontend
+    ports:
+      - "3000:3000"
+    volumes:
+      - ./frontend:/app
+      - /app/node_modules
+    environment:
+      - CHOKIDAR_USEPOLLING=true
+    depends_on:
+      - backend
     restart: unless-stopped
 
 volumes:

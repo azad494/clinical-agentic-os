@@ -29,3 +29,6 @@ timescaledb # (Optional, depending on your ingestion script)
 pandas
 numpy
 python-multipart  # Required for file uploads in FastAPI
+PyMuPDF>=1.23.0
+
+openpyxl>=3.1.2
