@@ -3,17 +3,18 @@ from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy.orm import Session
 from pydantic import BaseModel
 from typing import List, Dict, Any
-import httpx  # <-- NEW: For secure async API fetching
+import httpx  # For secure async API fetching
 import fitz   # PyMuPDF
 import io
 import os
 import base64
 import pandas as pd
 from litellm import completion, acompletion 
+from datetime import datetime # <-- NEW: Required for the audit trail timestamps
 
-# --- NEW: Database Imports ---
-import models
-from database import get_db, engine
+# --- Database Imports ---
+from app import models
+from app.database import get_db, engine
 
 # Create tables on startup (Standard for Phase 1 local development)
 models.Base.metadata.create_all(bind=engine)
@@ -125,7 +126,7 @@ async def fetch_and_stage_clinical_api(
 @app.post("/upload")
 async def upload_clinical_document(
     file: UploadFile = File(...),
-    db: Session = Depends(get_db)  # <-- NEW: Database Injection
+    db: Session = Depends(get_db) 
 ):
     if not file.filename:
         raise HTTPException(status_code=400, detail="Filename is missing.")
@@ -191,8 +192,7 @@ async def upload_clinical_document(
         )
         category = response.choices[0].message.content.strip()
 
-        # --- NEW: UNIVERSAL DATABASE INJECTION ---
-        # Before returning to the UI, save the parsed text safely in Postgres
+        # --- UNIVERSAL DATABASE INJECTION ---
         new_staged_doc = models.DocumentStaging(
             source=models.IngestionSource.MANUAL_UPLOAD,
             filename=file.filename,
@@ -224,3 +224,49 @@ async def upload_clinical_document(
     except Exception as e:
         print(f"Ingestion error: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Failed to process document: {str(e)}")
+
+
+# --- 7. NEW: ADMIN APPROVAL WORKFLOW ---
+class ReviewRequest(BaseModel):
+    status: str  # Expecting "approved" or "rejected"
+    admin_id: str = "admin_001" # Defaulting for local dev
+
+@app.put("/api/v1/documents/{staging_id}/review")
+async def review_staged_document(
+    staging_id: int, 
+    request: ReviewRequest, 
+    db: Session = Depends(get_db)
+):
+    """
+    Human-In-The-Loop (HITL) endpoint. 
+    Approves or rejects a staged document. If approved, it prepares for Qdrant embedding.
+    """
+    # 1. Find the document in Postgres
+    doc = db.query(models.DocumentStaging).filter(models.DocumentStaging.id == staging_id).first()
+    
+    if not doc:
+        raise HTTPException(status_code=404, detail="Staged document not found.")
+
+    # 2. Validate the status change
+    if request.status.lower() == "approved":
+        doc.status = models.DocumentStatus.APPROVED
+    elif request.status.lower() == "rejected":
+        doc.status = models.DocumentStatus.REJECTED
+    else:
+        raise HTTPException(status_code=400, detail="Invalid status. Must be 'approved' or 'rejected'.")
+
+    # 3. Update audit trail
+    doc.reviewed_by = request.admin_id
+    doc.reviewed_at = datetime.utcnow()
+    
+    db.commit()
+
+    # NOTE: In our very next step, we will add the code right here 
+    # to automatically send APPROVED documents to Qdrant Vector DB!
+
+    return {
+        "status": "success",
+        "document_id": staging_id,
+        "new_state": doc.status.value,
+        "message": f"Document successfully marked as {doc.status.value}."
+    }

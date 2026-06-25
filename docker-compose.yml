@@ -54,7 +54,10 @@ services:
       - redis
       - timescaledb
     volumes:
-      - ./backend/app:/app
+      - ./backend:/app
+      - /app/venv
+    environment:
+      - PYTHONPATH=/app
     restart: unless-stopped
 
   frontend:

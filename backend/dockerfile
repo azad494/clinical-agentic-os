@@ -9,7 +9,7 @@ RUN apt-get update && apt-get install -y build-essential libpq-dev && rm -rf /va
 
 # Install Python dependencies
 COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+RUN pip install --no-cache-dir --default-timeout=100 -r requirements.txt
 
 # Copy everything from the 'app' folder (your code) to /app
 COPY . .
@@ -18,4 +18,4 @@ COPY . .
 EXPOSE 8000
 
 # Start Uvicorn pointing directly to main.py at the root
-CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000", "--reload"]
+CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000", "--reload"]
