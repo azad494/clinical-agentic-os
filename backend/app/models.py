@@ -9,14 +9,16 @@ from sqlalchemy.sql import func
 
 # Define the strict state machine for document processing
 class DocumentStatus(enum.Enum):
-    PENDING_REVIEW = "pending_review"  # Awaiting human admin approval in the UI
+    PENDING_REVIEW = "pending_review"  # Ingested, text extracted, awaiting sanitization scan
+    CLEANING = "cleaning"              # <-- NEW: Actively locked by background cleaning worker
+    FAILED = "failed"                  # <-- NEW: Worker threw an error (corrupt format, timeout)
     APPROVED = "approved"              # Cleared to be embedded into Qdrant Vector DB
     REJECTED = "rejected"              # Flagged/Deleted due to massive errors or PHI risks
 
 # Track the exact origin of the clinical data
 class IngestionSource(enum.Enum):
     MANUAL_UPLOAD = "manual_upload"        # Drag-and-drop PDFs/Excel from the UI
-    MIMIC_API_WORKER = "mimic_api_worker" # Background Celery cron jobs pulling batches
+    MIMIC_API_WORKER = "mimic_api_worker"  # Background Celery cron jobs pulling batches
     DYNAMIC_API_UI = "dynamic_api_ui"      # Pasted endpoint URLs from the Command Center
 
 # The Universal Staging Table
@@ -40,8 +42,11 @@ class DocumentStaging(Base):
     # The Output Storage (The "After")
     sanitized_text: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     
+    # Operational Telemetry
+    # <-- NEW: Essential for debugging asynchronous worker failures or tracing issues
+    error_message: Mapped[Optional[str]] = mapped_column(Text, nullable=True) 
+
     # Audit Trail & Observability
-    # Using 'datetime' type hint for Mapped instead of SQLAlchemy class
     uploaded_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     reviewed_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
     reviewed_by: Mapped[Optional[str]] = mapped_column(String, nullable=True)

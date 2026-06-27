@@ -1,20 +1,23 @@
-from fastapi import FastAPI, UploadFile, File, HTTPException, WebSocket, WebSocketDisconnect, Depends
+# Add this right next to your existing FastAPI dependency imports
+from fastapi import FastAPI, UploadFile, File, HTTPException, WebSocket, WebSocketDisconnect, Depends, BackgroundTasks
+from app.tasks import run_automated_sanitization_agent 
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy.orm import Session
 from pydantic import BaseModel
 from typing import List, Dict, Any
-import httpx  # For secure async API fetching
-import fitz   # PyMuPDF
+import httpx   # For secure async API fetching
+import fitz    # PyMuPDF
 import io
 import os
 import base64
 import pandas as pd
 from litellm import completion, acompletion 
-from datetime import datetime # <-- NEW: Required for the audit trail timestamps
+from datetime import datetime 
 
-# --- Database Imports ---
+# --- Database and Schema Imports ---
 from app import models
 from app.database import get_db, engine
+from app.schemas import StagedDocumentResponse # <-- NEW: Enforces the schema contract across all endpoints
 
 # Create tables on startup (Standard for Phase 1 local development)
 models.Base.metadata.create_all(bind=engine)
@@ -84,9 +87,10 @@ async def websocket_chat(websocket: WebSocket):
 class APIFetchRequest(BaseModel):
     endpoint_url: str
 
-@app.post("/api/v1/fetch-clinical-api")
+@app.post("/api/v1/fetch-clinical-api", response_model=StagedDocumentResponse)
 async def fetch_and_stage_clinical_api(
     request: APIFetchRequest, 
+    background_tasks: BackgroundTasks,
     db: Session = Depends(get_db)
 ):
     """Securely fetches JSON from clinical APIs and stages it for AI Sanitization."""
@@ -110,12 +114,15 @@ async def fetch_and_stage_clinical_api(
         db.add(new_staged_doc)
         db.commit()
         db.refresh(new_staged_doc)
-        
-        return {
-            "status": "success", 
-            "message": "API data successfully staged for human review.", 
-            "staging_id": new_staged_doc.id
-        }
+        background_tasks.add_task(run_automated_sanitization_agent, new_staged_doc.id)
+        # Enforce validation and structure contract output mapping
+        return StagedDocumentResponse(
+            id=new_staged_doc.id,
+            filename="Live API Stream",
+            status=new_staged_doc.status.value,
+            category="Patient_EHR",
+            message="External API data stream successfully captured and quarantined."
+        )
         
     except Exception as db_error:
         db.rollback()
@@ -123,9 +130,10 @@ async def fetch_and_stage_clinical_api(
 
 
 # --- 6. THE UPGRADED MANUAL UPLOAD ENDPOINT ---
-@app.post("/upload")
+@app.post("/upload", response_model=StagedDocumentResponse)
 async def upload_clinical_document(
     file: UploadFile = File(...),
+    background_tasks: BackgroundTasks = BackgroundTasks(),
     db: Session = Depends(get_db) 
 ):
     if not file.filename:
@@ -204,29 +212,23 @@ async def upload_clinical_document(
         db.commit()
         db.refresh(new_staged_doc)
 
-        if category == "Unknown":
-            return {
-                "status": "requires_approval",
-                "filename": file.filename,
-                "category": category,
-                "staging_id": new_staged_doc.id,
-                "message": "Document type not recognized. Staged for review."
-            }
+        custom_message = "Document type not recognized. Staged for review." if category == "Unknown" else f"Successfully parsed and staged as {category}."
         
-        return {
-            "status": "success",
-            "filename": file.filename,
-            "category": category,
-            "staging_id": new_staged_doc.id,
-            "message": f"Successfully parsed and staged as {category}."
-        }
+        # Enforce validation and structure contract output mapping
+        return StagedDocumentResponse(
+            id=new_staged_doc.id,
+            filename=file.filename,
+            status=new_staged_doc.status.value,
+            category=category,
+            message=custom_message
+        )
 
     except Exception as e:
         print(f"Ingestion error: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Failed to process document: {str(e)}")
 
 
-# --- 7. NEW: ADMIN APPROVAL WORKFLOW ---
+# --- 7. ADMIN APPROVAL WORKFLOW ---
 class ReviewRequest(BaseModel):
     status: str  # Expecting "approved" or "rejected"
     admin_id: str = "admin_001" # Defaulting for local dev
@@ -241,13 +243,13 @@ async def review_staged_document(
     Human-In-The-Loop (HITL) endpoint. 
     Approves or rejects a staged document. If approved, it prepares for Qdrant embedding.
     """
-    # 1. Find the document in Postgres
+    # Find the document in Postgres
     doc = db.query(models.DocumentStaging).filter(models.DocumentStaging.id == staging_id).first()
     
     if not doc:
         raise HTTPException(status_code=404, detail="Staged document not found.")
 
-    # 2. Validate the status change
+    # Validate the status change
     if request.status.lower() == "approved":
         doc.status = models.DocumentStatus.APPROVED
     elif request.status.lower() == "rejected":
@@ -255,14 +257,11 @@ async def review_staged_document(
     else:
         raise HTTPException(status_code=400, detail="Invalid status. Must be 'approved' or 'rejected'.")
 
-    # 3. Update audit trail
+    # Update audit trail
     doc.reviewed_by = request.admin_id
     doc.reviewed_at = datetime.utcnow()
     
     db.commit()
-
-    # NOTE: In our very next step, we will add the code right here 
-    # to automatically send APPROVED documents to Qdrant Vector DB!
 
     return {
         "status": "success",
